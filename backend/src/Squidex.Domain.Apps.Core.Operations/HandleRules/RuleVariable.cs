@@ -8,7 +8,6 @@
 using System;
 using System.Linq;
 using System.Reflection;
-using System.Text.RegularExpressions;
 using Squidex.Domain.Apps.Core.Contents;
 using Squidex.Infrastructure.Json.Objects;
 using Squidex.Shared.Identity;
@@ -18,9 +17,6 @@ namespace Squidex.Domain.Apps.Core.HandleRules
 {
     public static class RuleVariable
     {
-        private static readonly Regex RegexPatternOld = new Regex(@"^(?<Type>[^_]*)_(?<Path>[^\s]*)", RegexOptions.Compiled);
-        private static readonly Regex RegexPatternNew = new Regex(@"^\{(?<Type>[^_]*)_(?<Path>[^\s]*)\}", RegexOptions.Compiled);
-
         public static (object? Result, string[] Remaining) GetValue(object @event, string[] path)
         {
             object? current = @event;
