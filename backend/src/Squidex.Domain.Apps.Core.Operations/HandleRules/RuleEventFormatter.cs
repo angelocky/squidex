@@ -9,17 +9,13 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Squidex.Domain.Apps.Core.Contents;
 using Squidex.Domain.Apps.Core.Rules.EnrichedEvents;
 using Squidex.Domain.Apps.Core.Scripting;
 using Squidex.Infrastructure;
 using Squidex.Infrastructure.Json;
-using Squidex.Infrastructure.Json.Objects;
-using Squidex.Shared.Identity;
 using Squidex.Shared.Users;
 
 namespace Squidex.Domain.Apps.Core.HandleRules
@@ -31,16 +27,18 @@ namespace Squidex.Domain.Apps.Core.HandleRules
         private static readonly Regex RegexPatternNew = new Regex(@"^\{(?<Type>[^_]*)_(?<Path>[^\s]*)\}", RegexOptions.Compiled);
         private readonly List<(char[] Pattern, Func<EnrichedEvent, string?> Replacer)> patterns = new List<(char[] Pattern, Func<EnrichedEvent, string?> Replacer)>();
         private readonly IJsonSerializer jsonSerializer;
+        private readonly IEnumerable<IRuleEventFormatter> formatters;
         private readonly IUrlGenerator urlGenerator;
         private readonly IScriptEngine scriptEngine;
 
-        public RuleEventFormatter(IJsonSerializer jsonSerializer, IUrlGenerator urlGenerator, IScriptEngine scriptEngine)
+        public RuleEventFormatter(IJsonSerializer jsonSerializer, IEnumerable<IRuleEventFormatter> formatters, IScriptEngine scriptEngine)
         {
             Guard.NotNull(jsonSerializer, nameof(jsonSerializer));
             Guard.NotNull(scriptEngine, nameof(scriptEngine));
             Guard.NotNull(urlGenerator, nameof(urlGenerator));
 
             this.jsonSerializer = jsonSerializer;
+            this.formatters = formatters;
             this.scriptEngine = scriptEngine;
             this.urlGenerator = urlGenerator;
 
@@ -76,7 +74,7 @@ namespace Squidex.Domain.Apps.Core.HandleRules
             return jsonSerializer.Serialize(new { type = @event.Name, payload = @event, timestamp = @event.Timestamp });
         }
 
-        public string? Format(string text, EnrichedEvent @event)
+        public async ValueTask<string?> FormatAsync(string text, EnrichedEvent @event)
         {
             if (string.IsNullOrWhiteSpace(text))
             {
@@ -93,34 +91,16 @@ namespace Squidex.Domain.Apps.Core.HandleRules
                 return scriptEngine.Interpolate(context, script);
             }
 
+            var parts = BuildParts(text, @event);
+
+            await Task.WhenAll(parts.Select(x => x.Task.AsTask()));
+
+            return BuildText(text, parts);
+        }
+
+        private static string BuildText(string text, List<(int Offset, int Length, ValueTask<string?> Task)> parts)
+        {
             var span = text.AsSpan();
-
-            var currentOffset = 0;
-
-            var parts = new List<(int Offset, int Length, ValueTask<string?> Task)>();
-
-            for (var i = 0; i < text.Length; i++)
-            {
-                var c = text[i];
-
-                if (c == '$')
-                {
-                    parts.Add((currentOffset, i - currentOffset, default));
-
-                    var (replacement, length) = GetReplacement(span.Slice(i + 1), @event);
-
-                    if (length > 0)
-                    {
-                        parts.Add((0, 0, new ValueTask<string?>(replacement)));
-
-                        i += length + 1;
-                    }
-
-                    currentOffset = i;
-                }
-            }
-
-            parts.Add((currentOffset, text.Length - currentOffset, default));
 
             var sb = new StringBuilder();
 
@@ -139,7 +119,41 @@ namespace Squidex.Domain.Apps.Core.HandleRules
             return sb.ToString();
         }
 
-        private (string Result, int Length) GetReplacement(ReadOnlySpan<char> test, EnrichedEvent @event)
+        private List<(int Offset, int Length, ValueTask<string?> Task)> BuildParts(string text, EnrichedEvent @event)
+        {
+            var parts = new List<(int Offset, int Length, ValueTask<string?> Task)>();
+
+            var span = text.AsSpan();
+
+            var currentOffset = 0;
+
+            for (var i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+
+                if (c == '$')
+                {
+                    parts.Add((currentOffset, i - currentOffset, default));
+
+                    var (replacement, length) = GetReplacement(span.Slice(i + 1), @event);
+
+                    if (length > 0)
+                    {
+                        parts.Add((0, 0, replacement)!);
+
+                        i += length + 1;
+                    }
+
+                    currentOffset = i;
+                }
+            }
+
+            parts.Add((currentOffset, text.Length - currentOffset, default));
+
+            return parts;
+        }
+
+        private (ValueTask<string> Result, int Length) GetReplacement(ReadOnlySpan<char> test, EnrichedEvent @event)
         {
             for (var j = 0; j < patterns.Count; j++)
             {
@@ -147,7 +161,19 @@ namespace Squidex.Domain.Apps.Core.HandleRules
 
                 if (test.StartsWith(pattern, StringComparison.OrdinalIgnoreCase))
                 {
-                    return (replacer(@event) ?? Fallback, pattern.Length);
+                    var result = replacer(@event) ?? Fallback;
+
+                    return (new ValueTask<string>(result), pattern.Length);
+                }
+            }
+
+            foreach (var formatter in formatters)
+            {
+                var (replaced, result, replacedLength) = formatter.Format(@event, test);
+
+                if (replaced)
+                {
+                    return (new ValueTask<string>(result), replacedLength);
                 }
             }
 
@@ -162,12 +188,24 @@ namespace Squidex.Domain.Apps.Core.HandleRules
 
             if (match.Success)
             {
-                var path = match.Groups["Path"].Value.Split('.', StringSplitOptions.RemoveEmptyEntries);
+                var path = match.Groups["Path"].Value.Split('.', StringSplitOptions.RemoveEmptyEntries).ToArray();
 
-                return (CalculateData(@event, path) ?? Fallback, match.Length);
+                foreach (var formatter in formatters)
+                {
+                    var (replaced, result) = formatter.Format(@event, path);
+
+                    if (replaced)
+                    {
+                        return (result, match.Length);
+                    }
+                }
+
+                var (fallback, _) = RuleVariable.GetValue(@event, path);
+
+                return (new ValueTask<string>(fallback?.ToString() ?? Fallback), match.Length);
             }
 
-            return (Fallback, 0);
+            return (new ValueTask<string>(Fallback), 0);
         }
 
         private static string TimestampDate(EnrichedEvent @event)
@@ -298,83 +336,6 @@ namespace Squidex.Domain.Apps.Core.HandleRules
             }
 
             return null;
-        }
-
-        private static string? CalculateData(object @event, string[] path)
-        {
-            object? current = @event;
-
-            foreach (var segment in path)
-            {
-                if (current is NamedContentData data)
-                {
-                    if (!data.TryGetValue(segment, out var temp) || temp == null)
-                    {
-                        return null;
-                    }
-
-                    current = temp;
-                }
-                else if (current is ContentFieldData field)
-                {
-                    if (!field.TryGetValue(segment, out var temp) || temp == null)
-                    {
-                        return null;
-                    }
-
-                    current = temp;
-                }
-                else if (current is IJsonValue json)
-                {
-                    if (!json.TryGet(segment, out var temp) || temp == null || temp.Type == JsonValueType.Null)
-                    {
-                        return null;
-                    }
-
-                    current = temp;
-                }
-                else if (current != null)
-                {
-                    if (current is IUser user)
-                    {
-                        var type = segment;
-
-                        if (string.Equals(type, "Name", StringComparison.OrdinalIgnoreCase))
-                        {
-                            type = SquidexClaimTypes.DisplayName;
-                        }
-
-                        var claim = user.Claims.FirstOrDefault(x => string.Equals(x.Type, type, StringComparison.OrdinalIgnoreCase));
-
-                        if (claim != null)
-                        {
-                            current = claim.Value;
-                            continue;
-                        }
-                    }
-
-                    const BindingFlags bindingFlags =
-                        BindingFlags.FlattenHierarchy |
-                        BindingFlags.Public |
-                        BindingFlags.Instance;
-
-                    var properties = current.GetType().GetProperties(bindingFlags);
-                    var property = properties.FirstOrDefault(x => x.CanRead && string.Equals(x.Name, segment, StringComparison.OrdinalIgnoreCase));
-
-                    if (property == null)
-                    {
-                        return null;
-                    }
-
-                    current = property.GetValue(current);
-                }
-                else
-                {
-                    return null;
-                }
-            }
-
-            return current?.ToString();
         }
 
         private static bool TryGetScript(string text, out string script)
